@@ -749,6 +749,9 @@ def _new_jdb_session(pid, kick_holder):
             except Exception:
                 pass
             proxy.close()
+            vis = _visible_jdwp_pids()
+            print(f"[*] adb jdwp 可见 {len(vis)} 个 pid，"
+                  f"{'含' if str(pid) in vis else '不含'} pid={pid}")
             raise Disconnected(
                 f"二次 attach 失败：新进程 {pid} 未暴露 JDWP 或 forward 无法建立")
         time.sleep(0.2)
@@ -932,10 +935,18 @@ def run_once():
             time.sleep(0.1)
         print("\n[*] jdb 已连上代理（阻塞在握手），现在启动 App ...")
 
-        # 启动 App（等待调试器状态），进程一出现立刻建立 forward 并放行代理
+        # 启动 App；进程一出现先确认存活并（默认）留出无调试器的启动窗口，
+        # 之后才建立 forward 并放行代理
         adb("shell", "am", "force-stop", APP)
         time.sleep(_vt(0.5))
-        started = adb("shell", "am", "start", "-D", "-n", ACTIVITY)
+        # 4.3.1 起壳带反调试看门狗：调试器一接入，App 数秒内自行退出。带 -D
+        # 启动会让 App 停在等调试器状态，必须立刻 attach，等于主动踩看门狗；
+        # 故默认不带 -D（4.2.x 及更早的旧壳仍可用 LYNKCO_USE_WAIT_DEBUGGER=1
+        # 恢复原行为）
+        use_wd = os.environ.get("LYNKCO_USE_WAIT_DEBUGGER") == "1"
+        start_args = ["shell", "am", "start"] + (["-D"] if use_wd else []) + \
+                     ["-n", ACTIVITY]
+        started = adb(*start_args)
         for ln in started.splitlines():
             if ln.strip():
                 print(f"    am start: {ln.strip()}")
@@ -955,7 +966,26 @@ def run_once():
             _dump_device_diagnostics("未取到 App PID")
             raise Disconnected("未取到 App PID：请确认模拟器已安装领克 App"
                                "（adb shell pm list packages | grep lynkco）")
-        print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)，立即建立转发 ...")
+        print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)")
+
+        if not use_wd:
+            # 让 App 在「无调试器」状态下自由跑完启动：常量类的 clinit 需要
+            # 十几秒真实运行时间（4.2.x 成功运行：resume 后 14s 才命中断点）。
+            # 调试器挂着时 App 会被看门狗杀掉，所以这段时间必须完全不 attach
+            settle = float(os.environ.get("LYNKCO_SETTLE", "22"))
+            print(f"[*] 无调试器等待 {settle:.0f}s，让 App 完成启动与常量类初始化 ...")
+            settle_deadline = time.time() + settle
+            while time.time() < settle_deadline:
+                pids = adb("shell", f"pidof {APP}").strip().split()
+                if not pids:
+                    _dump_device_diagnostics("等待启动期间 App 退出")
+                    raise Disconnected("等待启动期间 App 已退出")
+                if pids[0] != pid:
+                    print(f"[*] 启动期间进程变化 {pid} -> {pids[0]}")
+                    pid = pids[0]
+                time.sleep(1.0)
+
+        print(f"[*] 建立转发 jdwp:{pid} ...")
         adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
 
         _jdwp_kick = {"p": None}
@@ -1006,10 +1036,23 @@ def run_once():
         candidates = get_candidates()
 
         def _probe_candidates():
-            """逐个候选读 .c（静态字段），返回第一个有值的类；都空返回 None。"""
+            """逐个候选读 .c（静态字段），返回第一个有值的类；都空返回 None。
+
+            `Name unknown` 表示类尚未加载（壳还没解密/初始化到那一步），
+            与「类已加载但字段为空」是两种完全不同的失败，必须分开记录：
+            run 44465861682 里全是前者，误判成「字段改名」会走错方向。"""
+            unknown = 0
             for cls in candidates:
-                if parse_field(send_cmd(child, f"print {cls}.c", timeout=_vt(10))):
+                out = send_cmd(child, f"print {cls}.c", timeout=_vt(10))
+                if "Name unknown" in out:
+                    unknown += 1
+                    continue
+                if parse_field(out):
                     return cls
+            if unknown == len(candidates):
+                print("[*] 全部候选类未加载（Name unknown）：壳还没初始化到这一步")
+            else:
+                print("[*] 候选类已加载，但 .c 均为空")
             return None
 
         if os.environ.get("LYNKCO_USE_BREAKPOINT") == "1":
@@ -1035,56 +1078,41 @@ def run_once():
                 pass
             hit_cls = _probe_candidates()
         else:
-            # 4.3.1 起壳对方法断点敏感：挂 stop in 后约 4s 进程自行退出
-            # （run 44463567551，events 无 am_kill/am_anr/am_crash）；而同样
-            # attach + resume、不挂任何断点可稳定存活 15s 以上（run
-            # 44464184551 三轮实测）。故默认不挂断点。
-            # 但壳在调试器接入后会把自身重启成新进程（run 44464184551：
-            # 启动 pid 4314/5197/5962 -> 15s 后 4626/5424/6078，全部不同），
-            # 旧进程的 JDWP 随之消失。因此每轮先查 pid，变了就对新的 pid
-            # 重挂 forward 并二次 attach，再 suspend 读字段
-            print("\n[*] resume（不挂断点，放行 App 自行初始化）")
-            child.sendline("resume")
+            # 4.3.1 起壳带反调试看门狗：调试器接入后 App 数秒内自行退出
+            # （run 44465861682 三次尝试均如此：events 只有 am_proc_died，
+            # 无 am_kill/am_anr/am_crash）。而常量类的 clinit 需要十几秒
+            # 真实运行时间（4.2.x 成功运行：resume 后 14s 才命中断点）。
+            # 因此只能在「无调试器」时段让它跑完启动，attach 后立刻抢读；
+            # 读不到就断开调试器退回去等，而不是一直挂着把它拖死
             hit_cls = None
-            cur_pid = pid
-            for rnd in range(1, 13):
-                time.sleep(2.5)
-                pids = adb("shell", f"pidof {APP}").strip().split()
-                if cur_pid not in pids:
-                    new_pid = pids[0] if pids else ""
-                    print(f"[*] 第 {rnd} 轮：进程已变 {cur_pid} -> "
-                          f"{new_pid or '（无进程）'}（pidof={pids}）")
-                    try:
-                        child.kill(9)
-                    except Exception:
-                        pass
-                    proxy.close()
-                    if not new_pid:
-                        continue
-                    vis = _visible_jdwp_pids()
-                    print(f"[*] adb jdwp 可见 {len(vis)} 个 pid，"
-                          f"{'含新进程' if new_pid in vis else '不含新进程（JDWP 未开启）'}")
-                    cur_pid = new_pid
-                    child, proxy = _new_jdb_session(new_pid, _jdwp_kick)
-                    print("[+] 已对新进程建立 JDWP 会话，恢复读取")
+            deadline = time.time() + _vt(int(os.environ.get(
+                "LYNKCO_LOAD_TIMEOUT", "120")))
+            while hit_cls is None:
                 try:
                     send_cmd(child, "suspend", timeout=_vt(10))
                     hit_cls = _probe_candidates()
                 except Disconnected as e:
-                    # jdb 退出或 VM 在探测途中消失：下一轮按 pid 变化重挂
-                    print(f"[*] 第 {rnd} 轮：会话不可用（{e}），下一轮重查 pid")
-                    continue
-                print(f"[*] 第 {rnd} 轮探测（t≈{rnd * 2.5:.0f}s，pid={cur_pid}）："
-                      f"{'命中 ' + hit_cls if hit_cls else '字段未就绪'}")
+                    print(f"[*] 探测会话中断：{e}")
+                    hit_cls = None
                 if hit_cls:
                     break
+                if time.time() > deadline:
+                    raise Disconnected("等待期内始终读不到密钥字段："
+                                       "类未加载或字段已改名")
+                print("[*] 未读到密钥字段：断开调试器，让 App 继续运行 10s ...")
                 try:
-                    child.sendline("resume")
-                except OSError:
+                    child.kill(9)
+                except Exception:
                     pass
-            if hit_cls is None:
-                raise Disconnected("二次 attach + 12 轮探测（约 30s）仍未读到"
-                                   "密钥字段：新进程 JDWP 不可用或字段已改名")
+                proxy.close()
+                time.sleep(10)
+                pids = adb("shell", f"pidof {APP}").strip().split()
+                if not pids:
+                    _dump_device_diagnostics("等待类加载期间 App 退出")
+                    raise Disconnected("等待类加载期间 App 已退出（看门狗）")
+                pid = pids[0]
+                print(f"[*] 重新 attach 到 pid={pid} ...")
+                child, proxy = _new_jdb_session(pid, _jdwp_kick)
 
         print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
