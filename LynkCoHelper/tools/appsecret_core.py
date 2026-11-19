@@ -542,7 +542,10 @@ def cold_start_and_wait(emu, avd):
 class Proxy:
     """jdb 先连上并挂起在握手阶段；等上游就绪后抢先握手并双向转发。"""
 
-    def __init__(self):
+    def __init__(self, port=None):
+        # 端口可指定：4.3.1 壳会自我重启成新进程，需要在同一轮里对旧进程的
+        # 会话关闭后再建第二个代理（固定端口会因旧监听未释放而 bind 失败）
+        self.port = port or PROXY_PORT
         self.upstream_ready = threading.Event()
         self.handshake_done = threading.Event()
         self.upstream_failed = threading.Event()   # 上游连接/握手失败（进程已死等）
@@ -552,7 +555,7 @@ class Proxy:
     def start_and_serve(self):
         srv = socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", PROXY_PORT))
+        srv.bind(("127.0.0.1", self.port))
         srv.listen(1)
         # 1. 接受 jdb 连接，读取其握手请求并挂起
         self.jdb_sock, _ = srv.accept()
@@ -662,6 +665,98 @@ class Proxy:
 
 class Disconnected(Exception):
     """jdb 与目标 VM 的连接中断（App 反调试自杀或平台连接不稳），可重试。"""
+
+
+def _free_port():
+    """取一个空闲本地端口：二次 attach 不能复用旧代理端口（旧监听尚未
+    释放时 bind 会失败）。"""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _kick_adbd_jdwp(holder):
+    """常驻一个 `adb jdwp` 客户端。adbd 的 jdwp tracker 只在有活跃客户端
+    时扫描 /proc，端点才会注册（见 run_once 内 _refresh 注释）。
+    holder 跨会话共享，避免每次 attach 都重启客户端。"""
+    try:
+        p = holder.get("p")
+        if p is None or p.poll() is not None:
+            holder["p"] = subprocess.Popen(
+                [ADB, "jdwp"], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            import atexit
+            atexit.register(lambda q=holder["p"]:
+                            q.kill() if q.poll() is None else None)
+    except Exception:
+        pass
+
+
+def _visible_jdwp_pids(timeout=4):
+    """读取 `adb jdwp` 的 pid 列表。该命令打印列表后不退出，故限时读取
+    再 kill；结果只作日志判据（新进程是否真的暴露了 JDWP）。"""
+    p = subprocess.Popen([ADB, "jdwp"], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True)
+    out = ""
+    try:
+        out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            out, _ = p.communicate(timeout=5)
+        except Exception:
+            pass
+    return {ln.strip() for ln in (out or "").splitlines() if ln.strip().isdigit()}
+
+
+def _new_jdb_session(pid, kick_holder):
+    """对已在运行的进程新建 forward + 代理 + jdb 会话，返回 (child, proxy)。
+
+    4.3.1 起壳在调试器接入后自我重启成新进程（旧进程的 JDWP 随之消失），
+    需对新 pid 二次 attach。新进程已过启动期，其 JDWP 端点（若存在）应
+    已注册，无需早期窗口。失败抛 Disconnected。"""
+    port = _free_port()
+    proxy = Proxy(port)
+    threading.Thread(target=proxy.start_and_serve, daemon=True).start()
+    time.sleep(_vt(0.3))
+    child = pexpect.spawn(f"{shlex.quote(JDB)} -attach 127.0.0.1:{port}",
+                          timeout=60, encoding="utf-8")
+    child.logfile = ScrubStream()
+    for _ in range(80):
+        if proxy.status in ("jdb_connected", "upstream_ready", "relaying"):
+            break
+        time.sleep(0.1)
+
+    def _refresh():
+        _kick_adbd_jdwp(kick_holder)
+        r = subprocess.run([ADB, "forward", f"tcp:{UPSTREAM_PORT}",
+                            f"jdwp:{pid}"], capture_output=True, text=True)
+        if r.returncode != 0:
+            msg = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+            print(f"[!] forward jdwp:{pid} 失败（rc={r.returncode}）："
+                  f"{msg[-1][:200] if msg else '无输出'}")
+
+    proxy.refresh_upstream = _refresh
+    proxy.upstream_ready.set()
+    deadline = time.time() + _vt(int(os.environ.get(
+        "LYNKCO_REATTACH_TIMEOUT", "45")))
+    while not proxy.handshake_done.is_set():
+        if proxy.upstream_failed.is_set() or time.time() > deadline:
+            try:
+                child.kill(9)
+            except Exception:
+                pass
+            proxy.close()
+            raise Disconnected(
+                f"二次 attach 失败：新进程 {pid} 未暴露 JDWP 或 forward 无法建立")
+        time.sleep(0.2)
+    try:
+        child.expect(PROMPTS + [pexpect.EOF, pexpect.TIMEOUT], timeout=_vt(30))
+    except Exception:
+        pass
+    return child, proxy
 
 
 def send_cmd(child, cmd, timeout=15):
@@ -871,16 +966,7 @@ def run_once():
             # `adb jdwp` 客户端时工作——短连即断再立刻 connect 反而踩上
             # tracker 刚停的空窗。故后台常驻一个客户端，让扫描持续进行，
             # 再刷新 forward 让 adb 重新解析端点
-            try:
-                if _jdwp_kick["p"] is None or _jdwp_kick["p"].poll() is not None:
-                    _jdwp_kick["p"] = subprocess.Popen(
-                        [ADB, "jdwp"], stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL)
-                    import atexit
-                    atexit.register(lambda q=_jdwp_kick["p"]:
-                                    q.kill() if q.poll() is None else None)
-            except Exception:
-                pass
+            _kick_adbd_jdwp(_jdwp_kick)
             adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{p}")
 
         proxy.refresh_upstream = _refresh
@@ -952,23 +1038,53 @@ def run_once():
             # 4.3.1 起壳对方法断点敏感：挂 stop in 后约 4s 进程自行退出
             # （run 44463567551，events 无 am_kill/am_anr/am_crash）；而同样
             # attach + resume、不挂任何断点可稳定存活 15s 以上（run
-            # 44464184551 三轮实测）。故默认不挂断点：放行 App 完成静态字段
-            # 初始化，再 suspend 直接读字段
+            # 44464184551 三轮实测）。故默认不挂断点。
+            # 但壳在调试器接入后会把自身重启成新进程（run 44464184551：
+            # 启动 pid 4314/5197/5962 -> 15s 后 4626/5424/6078，全部不同），
+            # 旧进程的 JDWP 随之消失。因此每轮先查 pid，变了就对新的 pid
+            # 重挂 forward 并二次 attach，再 suspend 读字段
             print("\n[*] resume（不挂断点，放行 App 自行初始化）")
             child.sendline("resume")
             hit_cls = None
-            for rnd in range(1, 7):
-                time.sleep(3)
-                send_cmd(child, "suspend", timeout=_vt(10))
-                hit_cls = _probe_candidates()
-                print(f"[*] 第 {rnd} 轮探测（t≈{rnd * 3}s）："
+            cur_pid = pid
+            for rnd in range(1, 13):
+                time.sleep(2.5)
+                pids = adb("shell", f"pidof {APP}").strip().split()
+                if cur_pid not in pids:
+                    new_pid = pids[0] if pids else ""
+                    print(f"[*] 第 {rnd} 轮：进程已变 {cur_pid} -> "
+                          f"{new_pid or '（无进程）'}（pidof={pids}）")
+                    try:
+                        child.kill(9)
+                    except Exception:
+                        pass
+                    proxy.close()
+                    if not new_pid:
+                        continue
+                    vis = _visible_jdwp_pids()
+                    print(f"[*] adb jdwp 可见 {len(vis)} 个 pid，"
+                          f"{'含新进程' if new_pid in vis else '不含新进程（JDWP 未开启）'}")
+                    cur_pid = new_pid
+                    child, proxy = _new_jdb_session(new_pid, _jdwp_kick)
+                    print("[+] 已对新进程建立 JDWP 会话，恢复读取")
+                try:
+                    send_cmd(child, "suspend", timeout=_vt(10))
+                    hit_cls = _probe_candidates()
+                except Disconnected as e:
+                    # jdb 退出或 VM 在探测途中消失：下一轮按 pid 变化重挂
+                    print(f"[*] 第 {rnd} 轮：会话不可用（{e}），下一轮重查 pid")
+                    continue
+                print(f"[*] 第 {rnd} 轮探测（t≈{rnd * 2.5:.0f}s，pid={cur_pid}）："
                       f"{'命中 ' + hit_cls if hit_cls else '字段未就绪'}")
                 if hit_cls:
                     break
-                child.sendline("resume")
+                try:
+                    child.sendline("resume")
+                except OSError:
+                    pass
             if hit_cls is None:
-                raise Disconnected("6 轮探测（约 18s）仍未读到密钥字段，"
-                                   "类未初始化或字段已改名")
+                raise Disconnected("二次 attach + 12 轮探测（约 30s）仍未读到"
+                                   "密钥字段：新进程 JDWP 不可用或字段已改名")
 
         print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
