@@ -339,11 +339,17 @@ def ensure_apk():
     apk = None
     if os.environ.get("GITHUB_ACTIONS") == "true":
         # 写死上游仓库：fork 无 Release（fork 不复制 Release），动态拼
-        # GITHUB_REPOSITORY 在 fork 上必然 404；失败仍有官方 CDN 兜底
+        # GITHUB_REPOSITORY 在 fork 上必然 404；失败仍有官方 CDN 兜底。
+        # 可用 LYNKCO_APK_TAG 指定历史版本（如 apk-v4.2.9）：4.3.1 的 arm64
+        # 原生库在 x86_64 + libndk 下启动即 ANR 自杀，旧版没有这个问题，
+        # 而 nativeAppSecret 属线上签名密钥，不随版本轮换（否则旧客户端全废）
+        tag = os.environ.get("LYNKCO_APK_TAG", "apk-latest")
+        name = ("lynkco-latest.apk" if tag == "apk-latest"
+                else f"lynkco-{tag[len('apk-'):]}.apk")
         rel_url = ("https://github.com/shovelshit/LynkCoHelper/releases/download/"
-                   "apk-latest/lynkco-latest.apk")
-        dest = os.path.join(TOOLS_DIR, "lynkco-latest.apk")
-        print("[*] 尝试从仓库 Release 拉取 APK ...")
+                   f"{tag}/{name}")
+        dest = os.path.join(TOOLS_DIR, name)
+        print(f"[*] 尝试从仓库 Release 拉取 APK（{tag}）...")
         if _try_download(rel_url, dest, 285):
             apk = dest
     if apk is None:
@@ -1086,7 +1092,17 @@ def run_once():
                 child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
             except Exception:
                 pass
-            hit_cls = _probe_candidates()
+            # 断点落在 <clinit> 开头，字段赋值在其后的字节码里，必须单步
+            # 推进到有值为止（原实现如此；4.2.x 实测第 2~3 步出现值）
+            hit_cls = None
+            for i in range(15):
+                print(f"\n[*] next (step {i + 1})")
+                send_cmd(child, "next", timeout=_vt(15))
+                hit_cls = _probe_candidates()
+                if hit_cls:
+                    break
+            if hit_cls is None:
+                raise Disconnected("断点命中后单步 15 次仍未读到 .c 的值")
         else:
             # 两条硬事实决定了这里的策略：
             # 1) App 在本模拟器上启动后约 19.6s 就自行退出——run 44467263030
