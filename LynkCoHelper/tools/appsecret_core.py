@@ -917,6 +917,17 @@ def run_once():
         print("\n[*] suspend")
         send_cmd(child, "suspend", timeout=_vt(10))
 
+        if os.environ.get("LYNKCO_NO_BREAKPOINT") == "1":
+            # 临时诊断开关：不挂任何断点，只验证"纯 JDWP attach + resume"
+            # 是否已足以触发壳自杀（区分 anti-debug 与断点/命令触发）。
+            # 设 LYNKCO_NO_BREAKPOINT=1 启用；诊断完即可删除
+            print("\n[*] [diag] 跳过断点，resume 后观察 15s ...")
+            child.sendline("resume")
+            time.sleep(15)
+            alive = adb("shell", "pidof", APP).strip()
+            print(f"[*] [diag] 15s 后进程状态：{alive or '已退出'}")
+            return "", ""
+
         print("\n[*] Setting breakpoint ...")
         # 候选类的 <clinit> 全部挂延迟断点（对未加载的类不报错、仅挂起），
         # 哪个命中用哪个：优先 APK 自动定位，兑底硬编码候选
