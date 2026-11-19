@@ -966,14 +966,38 @@ def run_once():
         else:
             print("\n[!] 未命中断点（clinit 可能已提前执行），直接尝试打印字段 ...")
 
-        if hit_cls is None:
-            # 未命中断点时逐一候选探测字段，谁有值用谁
-            hit_cls = candidates[0]
+        # 一律复核候选的 .c 是否有值：4.3.1 起候选是 $a~$j 全量，clinit
+        # 命中顺序不再唯一，断点可能落在非密钥类上；以实际有值者为准
+        def _probe_candidates():
+            if hit_cls is not None and parse_field(
+                    send_cmd(child, f"print {hit_cls}.c", timeout=_vt(10))):
+                return hit_cls
             for cls in candidates:
-                probe = send_cmd(child, f"print {cls}.c", timeout=_vt(10))
-                if parse_field(probe):
-                    hit_cls = cls
+                if parse_field(send_cmd(child, f"print {cls}.c", timeout=_vt(10))):
+                    return cls
+            return None
+
+        probe_hit = _probe_candidates()
+        # 密钥类可能尚未初始化（其 clinit 还没跑到）：再放行最多 3 次，
+        # 等它自己的 clinit 断点命中后重新探测。超时/EOF 一律放弃并沿用
+        # 既有行为，不引入新的挂死风险
+        for _ in range(0 if probe_hit else 3):
+            try:
+                child.sendline("resume")
+                if child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
+                                timeout=_vt(60)) >= len(BREAKPOINT_PATTERNS):
                     break
+                child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
+                probe_hit = _probe_candidates()
+                if probe_hit:
+                    break
+            except Exception:
+                break
+        if probe_hit is None:
+            probe_hit = candidates[0]
+        if hit_cls is not None and probe_hit != hit_cls:
+            print(f"[*] 断点命中 {hit_cls} 但无可用密钥字段，改用 {probe_hit}")
+        hit_cls = probe_hit
 
         print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
@@ -1030,6 +1054,18 @@ def _scan_apk_for_key_classes(apk_path):
         # 的才是业务 dex 的引用点
         if off - prev_off > 1000 and next_off - off > 1000 and name not in found:
             found.append(name)
+    if not found:
+        # 4.3.1 起壳把业务 dex 与常量类并进同一张字符串表，密钥类只保留
+        # 定义区一份明文，孤立引用信号消失（2026-11-19 对 apk-latest 实测：
+        # 27 处 LynkCoConstants$ 命中中只有 $a~$j 这一串 35B 等距的定义区，
+        # 孤立判决恒为空）。此处退回定义区全部短名候选，由运行时按
+        # .c 是否有值自动判定真实密钥类（run_once 已支持多候选探测）。
+        for _off, name in hits:
+            if name not in found:
+                found.append(name)
+        if found:
+            print(f"[*] 未发现孤立引用（4.3.1+ 同表布局），回退定义区候选 "
+                  f"{len(found)} 个：{', '.join(found)}")
     return [f"com.safe.cons.LynkCoConstants${n}" for n in found]
 
 
@@ -1056,6 +1092,12 @@ def auto_detect_candidates():
         r = subprocess.run([ADB, "pull", base, dest],
                            capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(dest):
+            # 原先静默返回 []，与"扫描未命中"混为一谈，CI 里无法区分
+            # 是 adb pull 失败还是扫描规则失效（run 44459386543 卡在这）
+            out = ((r.stderr or "") + (r.stdout or "")).strip()
+            print(f"[!] adb pull 失败（rc={r.returncode}）：{base}")
+            if out:
+                print(f"    {out.splitlines()[-1][:300]}")
             return []
         cands = _scan_apk_for_key_classes(dest)
         try:
