@@ -969,11 +969,10 @@ def run_once():
         print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)")
 
         if not use_wd:
-            # 让 App 在「无调试器」状态下自由跑完启动：常量类的 clinit 需要
-            # 十几秒真实运行时间（4.2.x 成功运行：resume 后 14s 才命中断点）。
-            # 调试器挂着时 App 会被看门狗杀掉，所以这段时间必须完全不 attach
-            settle = float(os.environ.get("LYNKCO_SETTLE", "22"))
-            print(f"[*] 无调试器等待 {settle:.0f}s，让 App 完成启动与常量类初始化 ...")
+            # App 启动后约 20s 自行退出（见下方分支注释），可用窗口很短，
+            # 因此只等进程稳定 3s 就 attach，之后靠运行态 classes 轮询找 clinit
+            settle = float(os.environ.get("LYNKCO_SETTLE", "3"))
+            print(f"[*] 启动后等待 {settle:.0f}s 再 attach（窗口约 20s，需尽早接入）...")
             settle_deadline = time.time() + settle
             while time.time() < settle_deadline:
                 pids = adb("shell", f"pidof {APP}").strip().split()
@@ -1029,28 +1028,32 @@ def run_once():
         except Exception:
             pass
 
-        # 尽快冻结 VM，最大限度赢得与 clinit 的竞速
-        print("\n[*] suspend")
-        send_cmd(child, "suspend", timeout=_vt(10))
+        # 旧路径（-D）：尽快冻结 VM，最大限度赢得与 clinit 的竞速。
+        # 新路径（无 -D）不能冻结——App 必须继续运行才能走到 clinit
+        if use_wd:
+            print("\n[*] suspend")
+            send_cmd(child, "suspend", timeout=_vt(10))
 
         candidates = get_candidates()
 
-        def _probe_candidates():
+        def _probe_candidates(quick=False):
             """逐个候选读 .c（静态字段），返回第一个有值的类；都空返回 None。
 
             `Name unknown` 表示类尚未加载（壳还没解密/初始化到那一步），
             与「类已加载但字段为空」是两种完全不同的失败，必须分开记录：
-            run 44465861682 里全是前者，误判成「字段改名」会走错方向。"""
+            run 44465861682 里全是前者，误判成「字段改名」会走错方向。
+            quick=True 只查首个候选（$f 先验），用于窗口紧张时的兜底探测。"""
             unknown = 0
-            for cls in candidates:
+            probe_list = candidates[:1] if quick else candidates
+            for cls in probe_list:
                 out = send_cmd(child, f"print {cls}.c", timeout=_vt(10))
                 if "Name unknown" in out:
                     unknown += 1
                     continue
                 if parse_field(out):
                     return cls
-            if unknown == len(candidates):
-                print("[*] 全部候选类未加载（Name unknown）：壳还没初始化到这一步")
+            if unknown == len(probe_list):
+                print("[*] 候选类未加载（Name unknown）：壳还没初始化到这一步")
             else:
                 print("[*] 候选类已加载，但 .c 均为空")
             return None
@@ -1078,41 +1081,60 @@ def run_once():
                 pass
             hit_cls = _probe_candidates()
         else:
-            # 4.3.1 起壳带反调试看门狗：调试器接入后 App 数秒内自行退出
-            # （run 44465861682 三次尝试均如此：events 只有 am_proc_died，
-            # 无 am_kill/am_anr/am_crash）。而常量类的 clinit 需要十几秒
-            # 真实运行时间（4.2.x 成功运行：resume 后 14s 才命中断点）。
-            # 因此只能在「无调试器」时段让它跑完启动，attach 后立刻抢读；
-            # 读不到就断开调试器退回去等，而不是一直挂着把它拖死
+            # 两条硬事实决定了这里的策略：
+            # 1) App 在本模拟器上启动后约 19.6s 就自行退出——run 44467263030
+            #    全程没 attach 任何调试器，events 仍只有 am_proc_died(reason 2)，
+            #    无 am_kill/am_anr/am_crash，故这是 App 自身寿命，不是看门狗；
+            # 2) 4.2.x 成功那次，常量类 clinit 发生在启动后 14s（resume 后
+            #    14.0s 命中断点）。
+            # 所以可用窗口只有十几秒，且必须让 App 自由运行到 clinit。做法：
+            # 早期 attach 但不挂起，用 `classes`（不需要 suspend、不冻结 App）
+            # 轮询类是否已加载，命中后立刻 suspend 抢读
             hit_cls = None
-            deadline = time.time() + _vt(int(os.environ.get(
-                "LYNKCO_LOAD_TIMEOUT", "120")))
-            while hit_cls is None:
+            first = float(os.environ.get("LYNKCO_FIRST_PROBE", "8"))
+            life = float(os.environ.get("LYNKCO_LIFE", "32"))
+            n = 0
+
+            def _classes_probe():
+                """运行态查询类是否已加载。
+
+                VM 运行中 jdb 不显示提示符，send_cmd 会干等满超时（6s），
+                因此这里发送后只短读 1s 收集输出，不问提示符。"""
                 try:
-                    send_cmd(child, "suspend", timeout=_vt(10))
-                    hit_cls = _probe_candidates()
-                except Disconnected as e:
-                    print(f"[*] 探测会话中断：{e}")
-                    hit_cls = None
+                    child.sendline("classes com.safe.cons.LynkCoConstants")
+                    time.sleep(1.0)
+                    try:
+                        return child.read_nonblocking(size=65536, timeout=1.0) or ""
+                    except Exception:
+                        return ""
+                except (OSError, pexpect.EOF):
+                    raise Disconnected("jdb 已退出（classes 查询时）")
+
+            while hit_cls is None:
+                elapsed = time.time() - t0
+                if elapsed > life:
+                    raise Disconnected(f"启动后 {life:.0f}s 仍未读到密钥字段"
+                                       "（App 常在此后退出，窗口已过）")
+                if elapsed < first:
+                    time.sleep(min(0.5, first - elapsed))
+                    continue
+                n += 1
+                out = _classes_probe()
+                loaded = "LynkCoConstants" in out
+                print(f"[*] t={elapsed:.1f}s classes 查询："
+                      f"{'已加载' if loaded else '未加载'}（{out.strip()[:80]!r}）")
+                if not loaded and n % 4:
+                    continue
+                # 已加载则全量扫（找真实密钥类）；否则只做单候选兜底，
+                # 避免 10 个候选 ×1.1s 的冻结把整个窗口吃光
+                send_cmd(child, "suspend", timeout=_vt(10))
+                hit_cls = _probe_candidates(quick=not loaded)
                 if hit_cls:
                     break
-                if time.time() > deadline:
-                    raise Disconnected("等待期内始终读不到密钥字段："
-                                       "类未加载或字段已改名")
-                print("[*] 未读到密钥字段：断开调试器，让 App 继续运行 10s ...")
                 try:
-                    child.kill(9)
-                except Exception:
+                    child.sendline("resume")
+                except OSError:
                     pass
-                proxy.close()
-                time.sleep(10)
-                pids = adb("shell", f"pidof {APP}").strip().split()
-                if not pids:
-                    _dump_device_diagnostics("等待类加载期间 App 退出")
-                    raise Disconnected("等待类加载期间 App 已退出（看门狗）")
-                pid = pids[0]
-                print(f"[*] 重新 attach 到 pid={pid} ...")
-                child, proxy = _new_jdb_session(pid, _jdwp_kick)
 
         print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
