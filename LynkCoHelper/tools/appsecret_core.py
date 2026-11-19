@@ -1053,8 +1053,10 @@ def run_once():
                 if parse_field(out):
                     return cls
             if unknown == len(probe_list):
+                _probe_state["all_unloaded"] = True
                 print("[*] 候选类未加载（Name unknown）：壳还没初始化到这一步")
             else:
+                _probe_state["all_unloaded"] = False
                 print("[*] 候选类已加载，但 .c 均为空")
             return None
 
@@ -1088,27 +1090,13 @@ def run_once():
             # 2) 4.2.x 成功那次，常量类 clinit 发生在启动后 14s（resume 后
             #    14.0s 命中断点）。
             # 所以可用窗口只有十几秒，且必须让 App 自由运行到 clinit。做法：
-            # 早期 attach 但不挂起，用 `classes`（不需要 suspend、不冻结 App）
-            # 轮询类是否已加载，命中后立刻 suspend 抢读
+            # 早期 attach 但不挂起，从 t=12s 起按 ~3s 一轮做「suspend -> 只读
+            # $f.c -> resume」的轻量探测（单条命令约 1.1s，冻结占比很低），
+            # 命中后再全量确认。不用 jdb 的 classes：它忽略参数、打印全部
+            # 类（run 44468081586 一次刷出 2.8 万行，把 jdb 自己的输出管道堵住）
             hit_cls = None
-            first = float(os.environ.get("LYNKCO_FIRST_PROBE", "8"))
-            life = float(os.environ.get("LYNKCO_LIFE", "32"))
-            n = 0
-
-            def _classes_probe():
-                """运行态查询类是否已加载。
-
-                VM 运行中 jdb 不显示提示符，send_cmd 会干等满超时（6s），
-                因此这里发送后只短读 1s 收集输出，不问提示符。"""
-                try:
-                    child.sendline("classes com.safe.cons.LynkCoConstants")
-                    time.sleep(1.0)
-                    try:
-                        return child.read_nonblocking(size=65536, timeout=1.0) or ""
-                    except Exception:
-                        return ""
-                except (OSError, pexpect.EOF):
-                    raise Disconnected("jdb 已退出（classes 查询时）")
+            first = float(os.environ.get("LYNKCO_FIRST_PROBE", "12"))
+            life = float(os.environ.get("LYNKCO_LIFE", "45"))
 
             while hit_cls is None:
                 elapsed = time.time() - t0
@@ -1116,25 +1104,22 @@ def run_once():
                     raise Disconnected(f"启动后 {life:.0f}s 仍未读到密钥字段"
                                        "（App 常在此后退出，窗口已过）")
                 if elapsed < first:
-                    time.sleep(min(0.5, first - elapsed))
+                    time.sleep(min(0.3, first - elapsed))
                     continue
-                n += 1
-                out = _classes_probe()
-                loaded = "LynkCoConstants" in out
-                print(f"[*] t={elapsed:.1f}s classes 查询："
-                      f"{'已加载' if loaded else '未加载'}（{out.strip()[:80]!r}）")
-                if not loaded and n % 4:
-                    continue
-                # 已加载则全量扫（找真实密钥类）；否则只做单候选兜底，
-                # 避免 10 个候选 ×1.1s 的冻结把整个窗口吃光
                 send_cmd(child, "suspend", timeout=_vt(10))
-                hit_cls = _probe_candidates(quick=not loaded)
+                hit_cls = _probe_candidates(quick=True)
+                if hit_cls is None and _probe_state["all_unloaded"] is False:
+                    # $f 已加载但不是密钥类：仍处于挂起态，直接全量扫
+                    hit_cls = _probe_candidates(quick=False)
                 if hit_cls:
                     break
+                print(f"[*] t={elapsed:.1f}s 未命中（"
+                      f"{'类未加载' if _probe_state['all_unloaded'] else '类已加载但字段为空'}）")
                 try:
                     child.sendline("resume")
                 except OSError:
                     pass
+                time.sleep(1.0)
 
         print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
@@ -1257,6 +1242,11 @@ def auto_detect_candidates():
 
 
 _auto_candidates = {"resolved": False, "list": []}
+
+# 最近一次 _probe_candidates 的结果分类：True=全部候选都没加载（Name
+# unknown），False=至少一个已加载。探测分支靠它决定是继续等 clinit，
+# 还是立即全量扫
+_probe_state = {"all_unloaded": None}
 
 # 历史上验证过的密钥类短名（4.2.8 = $f）。仅用作首个断点的先验，真实
 # 密钥类仍由运行时 .c 探测确定，壳再次改名也不会误判
