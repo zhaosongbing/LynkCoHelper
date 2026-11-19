@@ -1102,6 +1102,7 @@ def run_once():
             hit_cls = None
             first = float(os.environ.get("LYNKCO_FIRST_PROBE", "12"))
             life = float(os.environ.get("LYNKCO_LIFE", "45"))
+            probe_activity = True
 
             while hit_cls is None:
                 elapsed = time.time() - t0
@@ -1112,6 +1113,15 @@ def run_once():
                     time.sleep(min(0.3, first - elapsed))
                     continue
                 send_cmd(child, "suspend", timeout=_vt(10))
+                if probe_activity:
+                    # 一次性判据：业务 dex 是否已解密加载。启动 Activity 就在
+                    # 业务 dex 里，它都 Name unknown 说明 App 还卡在壳的启动
+                    # 自检阶段，此时常量类不可能被加载，问题不在探测时机
+                    act_out = send_cmd(
+                        child, f"print {ACTIVITY.split('/')[1]}", timeout=_vt(10))
+                    print(f"[*] 业务 dex 探针（启动 Activity）："
+                          f"{'未加载' if 'Name unknown' in act_out else '已加载'}")
+                    probe_activity = False
                 hit_cls = _probe_candidates(quick=True)
                 if hit_cls is None and _probe_state["all_unloaded"] is False:
                     # $f 已加载但不是密钥类：仍处于挂起态，直接全量扫
@@ -1318,6 +1328,18 @@ def _device_postmortem():
             print("[*] events 缓冲无 am_* 生命周期记录")
     except Exception as e:
         print(f"[*] events 缓冲读取失败：{e}")
+    # 主缓冲里 App 自己的日志：壳退出前通常会留下原因（自检失败/模拟器检测）
+    try:
+        out = adb("logcat", "-d", "-t", "1200")
+        hits = [ln for ln in out.splitlines() if "lynkco" in ln.lower()]
+        if hits:
+            print(f"[*] logcat 主缓冲中与 App 相关的尾部 {len(hits)} 行：")
+            for ln in hits[-25:]:
+                print("    " + ln[:300])
+        else:
+            print("[*] logcat 主缓冲无 App 相关行")
+    except Exception as e:
+        print(f"[*] logcat 主缓冲读取失败：{e}")
 
 
 def extract_main_loop():
