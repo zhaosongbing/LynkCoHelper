@@ -921,7 +921,12 @@ def run_once():
         # 候选类的 <clinit> 全部挂延迟断点（对未加载的类不报错、仅挂起），
         # 哪个命中用哪个：优先 APK 自动定位，兑底硬编码候选
         candidates = get_candidates()
-        for cls in candidates:
+        # 只挂首个候选。每个 stop in 要 ~1.5s，10 个候选会把 VM 冻结
+        # 从 2s 拉到 17s（run 44462961919 实测：冻结 17.1s -> resume 后
+        # 4s 内 App 自行退出，events 里无 am_kill/am_anr/am_crash，判为壳
+        # 看门狗因长冻结自杀）。首个候选若不是密钥类，命中暂停后仍会
+        # 遍历全部候选按 .c 探测，不会漏
+        for cls in candidates[:1]:
             send_cmd(child, f"stop in {cls}.<clinit>", timeout=_vt(15))
 
         print("\n[*] resume")
@@ -978,16 +983,14 @@ def run_once():
             return None
 
         probe_hit = _probe_candidates()
-        # 密钥类可能尚未初始化（其 clinit 还没跑到）：再放行最多 3 次，
-        # 等它自己的 clinit 断点命中后重新探测。超时/EOF 一律放弃并沿用
-        # 既有行为，不引入新的挂死风险
+        # 密钥类可能尚未初始化（其 clinit 还没跑到）：resume 放行 3 秒后
+        # 主动 suspend 再探，最多 3 轮。不再等断点事件——只有一个断点，
+        # 等它可能白等 60s 且永远不来
         for _ in range(0 if probe_hit else 3):
             try:
                 child.sendline("resume")
-                if child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
-                                timeout=_vt(60)) >= len(BREAKPOINT_PATTERNS):
-                    break
-                child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
+                time.sleep(3)
+                send_cmd(child, "suspend", timeout=_vt(10))
                 probe_hit = _probe_candidates()
                 if probe_hit:
                     break
@@ -1063,6 +1066,12 @@ def _scan_apk_for_key_classes(apk_path):
         for _off, name in hits:
             if name not in found:
                 found.append(name)
+        # 把历史上验证过的密钥类短名提到首位：run_once 现在只对首个候选
+        # 挂断点（控制 VM 冻结时长），错了也只影响首个断点，命中后仍会
+        # 遍历全部候选按 .c 选真值。4.2.8 实测密钥类为 $f（见提交 8c31eb2）
+        if len(found) > 1 and _PRIOR_SHORT in found:
+            found.remove(_PRIOR_SHORT)
+            found.insert(0, _PRIOR_SHORT)
         if found:
             print(f"[*] 未发现孤立引用（4.3.1+ 同表布局），回退定义区候选 "
                   f"{len(found)} 个：{', '.join(found)}")
@@ -1114,6 +1123,10 @@ def auto_detect_candidates():
 
 
 _auto_candidates = {"resolved": False, "list": []}
+
+# 历史上验证过的密钥类短名（4.2.8 = $f）。仅用作首个断点的先验，真实
+# 密钥类仍由运行时 .c 探测确定，壳再次改名也不会误判
+_PRIOR_SHORT = "f"
 
 
 def get_candidates():
