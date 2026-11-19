@@ -918,6 +918,11 @@ def _dump_device_diagnostics(tag):
 
 def run_once():
     """单次完整提取；连接类故障抛 Disconnected 交由主循环重试。返回 (key, secret)。"""
+    # 先把候选类解析出来：此时 App 还没启动，设备空闲，285MB 的 adb pull
+    # 才跑得动。放到 attach 之后再拉会与 App 启动争 CPU（TCG 下 adbd 饿死，
+    # run 44469296500 就是 pull 到 13% 断掉）
+    candidates = get_candidates()
+
     proxy = Proxy()
     threading.Thread(target=proxy.start_and_serve, daemon=True).start()
     time.sleep(0.3)  # 等代理开始监听
@@ -1034,7 +1039,7 @@ def run_once():
             print("\n[*] suspend")
             send_cmd(child, "suspend", timeout=_vt(10))
 
-        candidates = get_candidates()
+        # 候选类已在本函数开头解析（get_candidates），此处不再重复拉取
 
         def _probe_candidates(quick=False):
             """逐个候选读 .c（静态字段），返回第一个有值的类；都空返回 None。
@@ -1217,15 +1222,25 @@ def auto_detect_candidates():
         dest = os.path.join(TOOLS_DIR, f"base-v{ver}.apk")
         print(f"[*] 拉取设备上的 APK 自动定位密钥常量类（v{ver}，约 285MB，"
               f"同版本仅此一次）...")
-        r = subprocess.run([ADB, "pull", base, dest],
-                           capture_output=True, text=True)
-        if r.returncode != 0 or not os.path.exists(dest):
+        r = None
+        for attempt in range(1, 3):
+            r = subprocess.run([ADB, "pull", base, dest],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and os.path.exists(dest) \
+                    and os.path.getsize(dest) > 0:
+                break
             # 原先静默返回 []，与"扫描未命中"混为一谈，CI 里无法区分
             # 是 adb pull 失败还是扫描规则失效（run 44459386543 卡在这）
             out = ((r.stderr or "") + (r.stdout or "")).strip()
-            print(f"[!] adb pull 失败（rc={r.returncode}）：{base}")
+            print(f"[!] adb pull 第 {attempt} 次失败（rc={r.returncode}）：{base}")
             if out:
                 print(f"    {out.splitlines()[-1][:300]}")
+            try:
+                os.remove(dest)   # 清掉半截文件，否则续传/重试会带上坏数据
+            except OSError:
+                pass
+        if r is None or r.returncode != 0 or not os.path.exists(dest):
+            # 每次失败的 rc/错误行已在上面的循环里打印
             return []
         cands = _scan_apk_for_key_classes(dest)
         try:
