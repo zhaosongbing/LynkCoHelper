@@ -1151,6 +1151,21 @@ def _device_postmortem():
                   "倾向反调试/主动退出）")
     except Exception as e:
         print(f"[*] logcat 读取失败：{e}")
+    # events 缓冲：am_proc_died/am_kill 能区分"系统杀（LMK/ANR）"与
+    # "进程自己退出"，这是 crash 缓冲为空时唯一的判据
+    try:
+        out = adb("logcat", "-d", "-b", "events", "-t", "400")
+        keys = ("am_proc_died", "am_kill", "am_crash", "am_anr",
+                "am_low_memory", "am_proc_start", "am_relaunch")
+        hits = [ln for ln in out.splitlines() if any(k in ln for k in keys)]
+        if hits:
+            print(f"[*] events 缓冲（am_* 生命周期）尾部 {len(hits)} 行：")
+            for ln in hits[-25:]:
+                print("    " + ln[:300])
+        else:
+            print("[*] events 缓冲无 am_* 生命周期记录")
+    except Exception as e:
+        print(f"[*] events 缓冲读取失败：{e}")
 
 
 def extract_main_loop():
