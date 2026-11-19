@@ -1131,6 +1131,28 @@ def get_candidates():
     return auto
 
 
+def _device_postmortem():
+    """断连后抓设备侧证据，区分"App 崩溃"与"反调试主动自杀"。
+    输出限量（崩溃缓冲尾部 40 行、每行截 300 字符），避免 CI 日志爆炸。"""
+    try:
+        alive = adb("shell", "pidof", APP).strip()
+        print(f"[*] 进程状态：{'存活 pid=' + alive if alive else '已退出（进程不存在）'}")
+    except Exception as e:
+        print(f"[*] 进程状态查询失败：{e}")
+    try:
+        out = adb("logcat", "-d", "-b", "crash", "-t", "100")
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        if lines:
+            print(f"[*] logcat -b crash 尾部 {len(lines)} 行：")
+            for ln in lines[-40:]:
+                print("    " + ln[:300])
+        else:
+            print("[*] logcat -b crash 为空（无 native crash 记录，"
+                  "倾向反调试/主动退出）")
+    except Exception as e:
+        print(f"[*] logcat 读取失败：{e}")
+
+
 def extract_main_loop():
     """提取主循环：调用前需已 setup(adb, jdb) 且设备就绪。"""
     key = secret = None
@@ -1150,6 +1172,7 @@ def extract_main_loop():
                 time.sleep(3)
         except Disconnected as e:
             print(f"\n[!] 第 {attempt} 次尝试失败：{e}")
+            _device_postmortem()
             if attempt < MAX_ATTEMPTS:
                 print("[*] 3 秒后自动重试（将重新 force-stop 并启动 App）...")
                 time.sleep(3)
