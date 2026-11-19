@@ -917,101 +917,58 @@ def run_once():
         print("\n[*] suspend")
         send_cmd(child, "suspend", timeout=_vt(10))
 
-        if os.environ.get("LYNKCO_NO_BREAKPOINT") == "1":
-            # 临时诊断开关：不挂任何断点，只验证"纯 JDWP attach + resume"
-            # 是否已足以触发壳自杀（区分 anti-debug 与断点/命令触发）。
-            # 设 LYNKCO_NO_BREAKPOINT=1 启用；诊断完即可删除
-            print("\n[*] [diag] 跳过断点，resume 后观察 15s ...")
-            child.sendline("resume")
-            time.sleep(15)
-            alive = adb("shell", "pidof", APP).strip()
-            print(f"[*] [diag] 15s 后进程状态：{alive or '已退出'}")
-            return "", ""
-
-        print("\n[*] Setting breakpoint ...")
-        # 候选类的 <clinit> 全部挂延迟断点（对未加载的类不报错、仅挂起），
-        # 哪个命中用哪个：优先 APK 自动定位，兑底硬编码候选
         candidates = get_candidates()
-        # 只挂首个候选。每个 stop in 要 ~1.5s，10 个候选会把 VM 冻结
-        # 从 2s 拉到 17s（run 44462961919 实测：冻结 17.1s -> resume 后
-        # 4s 内 App 自行退出，events 里无 am_kill/am_anr/am_crash，判为壳
-        # 看门狗因长冻结自杀）。首个候选若不是密钥类，命中暂停后仍会
-        # 遍历全部候选按 .c 探测，不会漏
-        for cls in candidates[:1]:
-            send_cmd(child, f"stop in {cls}.<clinit>", timeout=_vt(15))
 
-        print("\n[*] resume")
-        try:
-            child.sendline("resume")
-        except OSError as e:
-            raise Disconnected(f"jdb 进程已退出（{e}）")
-        # resume 后断点事件（"设置延迟的断点/断点命中"）会异步到达，这里
-        # 不能用 send_cmd（其静默等待可能提前吞掉断点事件），直接等断点文本。
-        idx = child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
-                           timeout=_vt(90))
-        if idx == len(BREAKPOINT_PATTERNS):
-            raise Disconnected("等待断点期间 jdb 已退出（EOF）")
-        hit_cls = None
-        if idx < len(BREAKPOINT_PATTERNS):
-            print("\n[+] Breakpoint hit!")
-            time.sleep(0.2)
-            seg = ""
-            try:
-                child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
-                seg = child.before or ""
-            except Exception:
-                pass
-            # 断点输出形如："线程=main", com.safe.cons.LynkCoConstants$f.<clinit>(),
-            # 行=1 bci=7——从命中输出解析实际命中的候选类
-            m = re.search(r"com\.safe\.cons\.LynkCoConstants\$\w+", seg)
-            if m and m.group(0) in candidates:
-                hit_cls = m.group(0)
-                print(f"[*] 命中密钥常量类: {hit_cls}")
-            else:
-                # 输出里没解析到类名时退回首选候选（同旧行为）
-                hit_cls = candidates[0]
-            for i in range(15):
-                print(f"\n[*] next (step {i + 1})")
-                send_cmd(child, "next", timeout=_vt(15))
-                out = send_cmd(child, f"print {hit_cls}.c", timeout=_vt(10))
-                val = parse_field(out)
-                print(f"    -> c probe: "
-                      f"{'有值（' + str(len(val)) + ' 位）' if val else 'None'}")
-                if val:
-                    break
-        else:
-            print("\n[!] 未命中断点（clinit 可能已提前执行），直接尝试打印字段 ...")
-
-        # 一律复核候选的 .c 是否有值：4.3.1 起候选是 $a~$j 全量，clinit
-        # 命中顺序不再唯一，断点可能落在非密钥类上；以实际有值者为准
         def _probe_candidates():
-            if hit_cls is not None and parse_field(
-                    send_cmd(child, f"print {hit_cls}.c", timeout=_vt(10))):
-                return hit_cls
+            """逐个候选读 .c（静态字段），返回第一个有值的类；都空返回 None。"""
             for cls in candidates:
                 if parse_field(send_cmd(child, f"print {cls}.c", timeout=_vt(10))):
                     return cls
             return None
 
-        probe_hit = _probe_candidates()
-        # 密钥类可能尚未初始化（其 clinit 还没跑到）：resume 放行 3 秒后
-        # 主动 suspend 再探，最多 3 轮。不再等断点事件——只有一个断点，
-        # 等它可能白等 60s 且永远不来
-        for _ in range(0 if probe_hit else 3):
+        if os.environ.get("LYNKCO_USE_BREAKPOINT") == "1":
+            # 旧壳路线（4.2.x 及更早）：靠 <clinit> 断点抢在字段赋值前后暂停。
+            # 4.3.1 一挂方法断点就自杀，故降级为可选路径
+            print("\n[*] Setting breakpoint ...")
+            for cls in candidates[:1]:
+                send_cmd(child, f"stop in {cls}.<clinit>", timeout=_vt(15))
+            print("\n[*] resume")
             try:
                 child.sendline("resume")
+            except OSError as e:
+                raise Disconnected(f"jdb 进程已退出（{e}）")
+            idx = child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
+                               timeout=_vt(90))
+            if idx == len(BREAKPOINT_PATTERNS):
+                raise Disconnected("等待断点期间 jdb 已退出（EOF）")
+            print("\n[+] Breakpoint hit!")
+            time.sleep(0.2)
+            try:
+                child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
+            except Exception:
+                pass
+            hit_cls = _probe_candidates()
+        else:
+            # 4.3.1 起壳对方法断点敏感：挂 stop in 后约 4s 进程自行退出
+            # （run 44463567551，events 无 am_kill/am_anr/am_crash）；而同样
+            # attach + resume、不挂任何断点可稳定存活 15s 以上（run
+            # 44464184551 三轮实测）。故默认不挂断点：放行 App 完成静态字段
+            # 初始化，再 suspend 直接读字段
+            print("\n[*] resume（不挂断点，放行 App 自行初始化）")
+            child.sendline("resume")
+            hit_cls = None
+            for rnd in range(1, 7):
                 time.sleep(3)
                 send_cmd(child, "suspend", timeout=_vt(10))
-                probe_hit = _probe_candidates()
-                if probe_hit:
+                hit_cls = _probe_candidates()
+                print(f"[*] 第 {rnd} 轮探测（t≈{rnd * 3}s）："
+                      f"{'命中 ' + hit_cls if hit_cls else '字段未就绪'}")
+                if hit_cls:
                     break
-            except Exception:
-                break
-        if probe_hit is None:
-            probe_hit = candidates[0]
-        if hit_cls is not None and probe_hit != hit_cls:
-            print(f"[*] 断点命中 {hit_cls} 但无可用密钥字段，改用 {probe_hit}")
-        hit_cls = probe_hit
+                child.sendline("resume")
+            if hit_cls is None:
+                raise Disconnected("6 轮探测（约 18s）仍未读到密钥字段，"
+                                   "类未初始化或字段已改名")
 
         print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
